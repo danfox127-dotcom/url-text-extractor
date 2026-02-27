@@ -35,7 +35,6 @@ def apply_custom_style():
 # --- 3. SCRAPING & FORMATTING LOGIC ---
 def extract_content(url):
     try:
-        # HUMAN SPOOFING HEADERS TO AVOID 429 ERRORS
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -43,9 +42,7 @@ def extract_content(url):
             'Connection': 'keep-alive'
         }
         
-        # Add random delay to be gentle to the server
         time.sleep(random.uniform(1.0, 2.0))
-        
         response = requests.get(url, headers=headers, timeout=15)
         
         if response.status_code == 429:
@@ -54,11 +51,9 @@ def extract_content(url):
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Detect Title
         page_title = soup.find('h1')
         title_text = page_title.get_text().strip() if page_title else url.split('/')[-1]
         
-        # Remove noise
         for element in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe"]):
             element.decompose()
             
@@ -78,7 +73,6 @@ def extract_content(url):
             formatted_data.append(chunk)
             
         return title_text, formatted_data
-
     except Exception as e:
         return None, str(e)
 
@@ -88,7 +82,6 @@ def create_word_doc(title, formatted_data):
     for chunk in formatted_data:
         p_style = 'List Bullet' if chunk['tag'] == 'li' else None
         p = doc.add_paragraph(style=p_style) if p_style else doc.add_paragraph()
-        
         for style_type, text in chunk['content']:
             run = p.add_run(text)
             if style_type == 'bold' or chunk['tag'] in ['h2', 'h3', 'h4']:
@@ -105,7 +98,6 @@ apply_custom_style()
 
 st.title("🩺 CUIMC Web-to-Word Converter")
 
-# Sidebar
 with st.sidebar:
     st.header("📊 Dashboard")
     st.metric("Total Processed", st.session_state.total_converted)
@@ -120,7 +112,6 @@ with st.sidebar:
         st.session_state.bulk_zip = None
         st.rerun()
 
-# Main Tabs
 tab1, tab2 = st.tabs(["📄 Single URL", "📦 Bulk ZIP Download"])
 
 with tab1:
@@ -128,7 +119,6 @@ with tab1:
     if st.button("Generate Word Document", key="btn_single"):
         with st.spinner("Processing..."):
             title, data = extract_content(url_input)
-            
             if data == "RATE_LIMIT_ERROR":
                 st.error("⚠️ Server is rate-limiting us. Please wait 60 seconds.")
             elif data and isinstance(data, list):
@@ -169,4 +159,18 @@ with tab2:
                         if title not in st.session_state.history:
                             st.session_state.history.append(title)
                         success_count += 1
-                    progress_bar.progress((idx +
+                    progress_bar.progress((idx + 1) / len(url_list))
+            
+            if success_count > 0:
+                st.session_state.bulk_zip = zip_buffer.getvalue()
+                st.success(f"Processed {success_count} files!")
+            else:
+                st.error("Bulk processing failed.")
+            
+    if st.session_state.bulk_zip:
+        st.download_button(
+            label="📥 Download ZIP Archive",
+            data=st.session_state.bulk_zip,
+            file_name="cuimc_batch_files.zip",
+            mime="application/zip"
+        )
