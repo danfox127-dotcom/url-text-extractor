@@ -29,42 +29,36 @@ def apply_custom_style():
         .stButton > button:hover { background-color: #2a5a8a; color: white; }
         .stSidebar { background-color: #e9ecef; }
         [data-testid="stMetricValue"] { color: #1C3F60; font-weight: bold; }
-        .stTabs [data-baseweb="tab-list"] { gap: 24px; }
-        .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; background-color: #f0f2f6; border-radius: 5px 5px 0 0; padding: 10px; }
-        .stTabs [aria-selected="true"] { background-color: #1C3F60; color: white; }
         </style>
     """, unsafe_allow_html=True)
 
 # --- 3. SCRAPING & FORMATTING LOGIC ---
 def extract_content(url):
     try:
-        # HUMAN SPOOFING HEADERS
+        # HUMAN SPOOFING HEADERS TO AVOID 429 ERRORS
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.5',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
+            'Connection': 'keep-alive'
         }
         
-        # Add a "human" delay to prevent 429 errors
-        time.sleep(random.uniform(1.0, 2.5))
+        # Add random delay to be gentle to the server
+        time.sleep(random.uniform(1.0, 2.0))
         
         response = requests.get(url, headers=headers, timeout=15)
         
-        # Specific handling for 429
         if response.status_code == 429:
             return None, "RATE_LIMIT_ERROR"
             
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Title Detection
+        # Detect Title
         page_title = soup.find('h1')
         title_text = page_title.get_text().strip() if page_title else url.split('/')[-1]
         
-        # Cleanup page noise
+        # Remove noise
         for element in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe"]):
             element.decompose()
             
@@ -82,10 +76,9 @@ def extract_content(url):
                 else:
                     chunk['content'].append(('text', child.get_text()))
             formatted_data.append(chunk)
+            
         return title_text, formatted_data
 
-    except requests.exceptions.HTTPError as e:
-        return None, f"HTTP Error: {e.response.status_code}"
     except Exception as e:
         return None, str(e)
 
@@ -115,7 +108,7 @@ st.title("🩺 CUIMC Web-to-Word Converter")
 # Sidebar
 with st.sidebar:
     st.header("📊 Dashboard")
-    st.metric("Total Files Processed", st.session_state.total_converted)
+    st.metric("Total Processed", st.session_state.total_converted)
     st.divider()
     st.header("📜 Session History")
     for item in reversed(st.session_state.history):
@@ -128,4 +121,52 @@ with st.sidebar:
         st.rerun()
 
 # Main Tabs
-tabs = st.tabs(["
+tab1, tab2 = st.tabs(["📄 Single URL", "📦 Bulk ZIP Download"])
+
+with tab1:
+    url_input = st.text_input("Paste target URL:", key="single_input")
+    if st.button("Generate Word Document", key="btn_single"):
+        with st.spinner("Processing..."):
+            title, data = extract_content(url_input)
+            
+            if data == "RATE_LIMIT_ERROR":
+                st.error("⚠️ Server is rate-limiting us. Please wait 60 seconds.")
+            elif data and isinstance(data, list):
+                st.session_state.active_file = create_word_doc(title, data)
+                st.session_state.active_name = f"{title}.docx"
+                st.session_state.total_converted += 1
+                if title not in st.session_state.history:
+                    st.session_state.history.append(title)
+            else:
+                st.error(f"Error: {data}")
+
+    if st.session_state.active_file:
+        st.success(f"✅ Ready: {st.session_state.active_name}")
+        st.download_button(
+            label="📥 Download Word File",
+            data=st.session_state.active_file,
+            file_name=st.session_state.active_name,
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        )
+
+with tab2:
+    bulk_input = st.text_area("Paste URLs (one per line):", height=200)
+    if st.button("Process Bulk List", key="btn_bulk"):
+        url_list = [u.strip() for u in bulk_input.split('\n') if u.strip()]
+        if url_list:
+            zip_buffer = BytesIO()
+            success_count = 0
+            progress_bar = st.progress(0)
+            
+            with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+                for idx, url in enumerate(url_list):
+                    title, data = extract_content(url)
+                    if data and isinstance(data, list):
+                        doc_io = create_word_doc(title, data)
+                        clean_title = "".join([c for c in title if c.isalnum() or c==' ']).rstrip()
+                        zip_file.writestr(f"{clean_title}.docx", doc_io.getvalue())
+                        st.session_state.total_converted += 1
+                        if title not in st.session_state.history:
+                            st.session_state.history.append(title)
+                        success_count += 1
+                    progress_bar.progress((idx +
