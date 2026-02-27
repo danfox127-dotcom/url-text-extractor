@@ -4,9 +4,29 @@ from bs4 import BeautifulSoup, NavigableString
 from docx import Document
 from io import BytesIO
 import zipfile
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
 
-# --- CORE LOGIC: SMART FORMATTING ---
+# --- 1. INITIALIZE SESSION STATE ---
+if 'history' not in st.session_state:
+    st.session_state.history = []
+if 'total_converted' not in st.session_state:
+    st.session_state.total_converted = 0
 
+# --- 2. STYLING ---
+def apply_custom_style():
+    st.markdown("""
+        <style>
+        .stApp { background-color: #f8f9fa; }
+        h1 { color: #1C3F60 !important; font-family: 'Helvetica Neue', Arial, sans-serif; }
+        div.stButton > button:first-child { background-color: #1C3F60; color: white; width: 100%; border-radius: 5px; }
+        .stSidebar { background-color: #e9ecef; }
+        </style>
+    """, unsafe_allow_html=True)
+
+# --- 3. CORE LOGIC ---
 def extract_content(url):
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -14,30 +34,18 @@ def extract_content(url):
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # Grab Title
         page_title = soup.find('h1')
-        title_text = page_title.get_text().strip() if page_title else "Extracted Content"
+        title_text = page_title.get_text().strip() if page_title else url.split('/')[-1]
         
-        # Clean the soup
         for element in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
             element.decompose()
             
-        # Target the main content area (usually <main> or <div> with specific classes)
-        # If no main tag, we use the body
         content_area = soup.find('main') or soup.body
-        
-        # We will return a list of "formatted chunks"
         formatted_data = []
-        
-        # Tags we want to process
         tags_to_save = ['p', 'h2', 'h3', 'h4', 'li']
         
         for element in content_area.find_all(tags_to_save):
-            chunk = {
-                'tag': element.name,
-                'content': []
-            }
-            # Look inside the tag for bold/strong styling
+            chunk = {'tag': element.name, 'content': []}
             for child in element.children:
                 if isinstance(child, NavigableString):
                     chunk['content'].append(('text', child))
@@ -45,38 +53,61 @@ def extract_content(url):
                     chunk['content'].append(('bold', child.get_text()))
                 else:
                     chunk['content'].append(('text', child.get_text()))
-            
             formatted_data.append(chunk)
-            
         return title_text, formatted_data
     except Exception as e:
         return None, str(e)
 
-def create_word_doc(title, formatted_data):
+def create_word_doc(title, formatted_data, add_toc=False):
     doc = Document()
     doc.add_heading(title, 0)
-    
     for chunk in formatted_data:
-        tag = chunk['tag']
-        
-        # Create a paragraph based on tag type
-        if tag == 'li':
-            p = doc.add_paragraph(style='List Bullet')
-        elif tag in ['h2', 'h3', 'h4']:
-            p = doc.add_paragraph()
-            # We'll make headers bold manually for simplicity
-        else:
-            p = doc.add_paragraph()
-
-        # Add the text runs with styling
+        p = doc.add_paragraph(style='List Bullet') if chunk['tag'] == 'li' else doc.add_paragraph()
         for style_type, text in chunk['content']:
             run = p.add_run(text)
-            if style_type == 'bold' or tag in ['h2', 'h3', 'h4']:
+            if style_type == 'bold' or chunk['tag'] in ['h2', 'h3', 'h4']:
                 run.bold = True
-                
     bio = BytesIO()
     doc.save(bio)
     bio.seek(0)
     return bio
 
-# --- THE REST OF YOUR UI CODE REMAINS THE SAME ---
+# --- 4. UI LAYOUT ---
+apply_custom_style()
+st.title("🩺 CUIMC Web-to-Word Converter")
+
+with st.sidebar:
+    st.header("📊 Dashboard")
+    st.metric("Total Processed", st.session_state.total_converted)
+    st.divider()
+    st.header("📜 Session History")
+    for item in reversed(st.session_state.history):
+        st.write(f"• {item}")
+    if st.button("Clear History"):
+        st.session_state.history = []
+        st.rerun()
+
+tabs = st.tabs(["Single URL", "Bulk & ZIP"])
+
+with tabs[0]:
+    single_url = st.text_input("Paste URL:")
+    if st.button("Convert Single"):
+        title, data = extract_content(single_url)
+        if data and isinstance(data, list):
+            doc_file = create_word_doc(title, data)
+            st.session_state.total_converted += 1
+            st.session_state.history.append(title)
+            st.download_button("📥 Download Word Doc", data=doc_file, file_name=f"{title}.docx")
+
+with tabs[1]:
+    bulk_urls = st.text_area("URLs (one per line):")
+    if st.button("Generate ZIP"):
+        url_list = [u.strip() for u in bulk_urls.split('\n') if u.strip()]
+        zip_buffer = BytesIO()
+        with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
+            for url in url_list:
+                title, data = extract_content(url)
+                if data and isinstance(data, list):
+                    doc_io = create_word_doc(title, data)
+                    zip_file.writestr(f"{title}.docx", doc_io.getvalue())
+                    st.session_state
