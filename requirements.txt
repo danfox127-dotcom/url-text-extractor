@@ -1,3 +1,7 @@
+streamlit
+requests
+beautifulsoup4
+python-docx
+Pillow
 altair
 pandas
-streamlit
