@@ -7,7 +7,10 @@ import zipfile
 import time
 import random
 
-# --- 1. INITIALIZE SESSION STATE ---
+# --- 1. SET PAGE CONFIG (Must be first) ---
+st.set_page_config(page_title="CUIMC Web-to-Word", page_icon="🩺", layout="wide")
+
+# --- 2. INITIALIZE SESSION STATE ---
 if 'history' not in st.session_state:
     st.session_state.history = []
 if 'total_converted' not in st.session_state:
@@ -19,7 +22,7 @@ if 'active_name' not in st.session_state:
 if 'bulk_zip' not in st.session_state:
     st.session_state.bulk_zip = None
 
-# --- 2. CUIMC THEMING ---
+# --- 3. CUIMC THEMING ---
 def apply_custom_style():
     st.markdown("""
         <style>
@@ -32,49 +35,68 @@ def apply_custom_style():
         </style>
     """, unsafe_allow_html=True)
 
-# --- 3. SCRAPING & FORMATTING LOGIC ---
-def extract_content(url):
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Connection': 'keep-alive'
-        }
-        
-        time.sleep(random.uniform(1.0, 2.0))
-        response = requests.get(url, headers=headers, timeout=15)
-        
-        if response.status_code == 429:
-            return None, "RATE_LIMIT_ERROR"
+# --- 4. SCRAPING & FORMATTING LOGIC ---
+def extract_content(url, retries=2):
+    attempt = 0
+    while attempt <= retries:
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Connection': 'keep-alive'
+            }
             
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        page_title = soup.find('h1')
-        title_text = page_title.get_text().strip() if page_title else url.split('/')[-1]
-        
-        for element in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe"]):
-            element.decompose()
+            # Slightly longer delay for large batches to avoid firewalls
+            time.sleep(random.uniform(1.5, 3.0))
             
-        content_area = soup.find('main') or soup.find('article') or soup.body
-        formatted_data = []
-        tags_to_save = ['p', 'h2', 'h3', 'h4', 'li']
-        
-        for element in content_area.find_all(tags_to_save):
-            chunk = {'tag': element.name, 'content': []}
-            for child in element.children:
-                if isinstance(child, NavigableString):
-                    chunk['content'].append(('text', str(child)))
-                elif child.name in ['b', 'strong']:
-                    chunk['content'].append(('bold', child.get_text()))
-                else:
-                    chunk['content'].append(('text', child.get_text()))
-            formatted_data.append(chunk)
+            response = requests.get(url, headers=headers, timeout=15)
             
-        return title_text, formatted_data
-    except Exception as e:
-        return None, str(e)
+            if response.status_code == 429:
+                if attempt < retries:
+                    time.sleep(5)  # Wait 5 seconds and retry if rate limited
+                    attempt += 1
+                    continue
+                return None, "RATE_LIMIT_ERROR"
+                
+            response.raise_for_status()
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Better Title Detection to fix the "Trailing Slash" bug
+            page_title = soup.find('h1')
+            if page_title:
+                title_text = page_title.get_text().strip()
+            else:
+                # Filter out empty strings from trailing slashes
+                url_parts = [p for p in url.split('/') if p]
+                title_text = url_parts[-1] if url_parts else "Columbia_Page"
+            
+            for element in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe"]):
+                element.decompose()
+                
+            content_area = soup.find('main') or soup.find('article') or soup.body
+            formatted_data = []
+            tags_to_save = ['p', 'h2', 'h3', 'h4', 'li']
+            
+            for element in content_area.find_all(tags_to_save):
+                chunk = {'tag': element.name, 'content': []}
+                for child in element.children:
+                    if isinstance(child, NavigableString):
+                        chunk['content'].append(('text', str(child)))
+                    elif child.name in ['b', 'strong']:
+                        chunk['content'].append(('bold', child.get_text()))
+                    else:
+                        chunk['content'].append(('text', child.get_text()))
+                formatted_data.append(chunk)
+                
+            return title_text, formatted_data
+            
+        except Exception as e:
+            if attempt < retries:
+                time.sleep(2)
+                attempt += 1
+            else:
+                return None, str(e)
 
 def create_word_doc(title, formatted_data):
     doc = Document()
@@ -92,8 +114,7 @@ def create_word_doc(title, formatted_data):
     bio.seek(0)
     return bio
 
-# --- 4. APP LAYOUT ---
-st.set_page_config(page_title="CUIMC Web-to-Word", page_icon="🩺", layout="wide")
+# --- 5. APP LAYOUT ---
 apply_custom_style()
 
 st.title("🩺 CUIMC Web-to-Word Converter")
@@ -146,26 +167,48 @@ with tab2:
         if url_list:
             zip_buffer = BytesIO()
             success_count = 0
-            progress_bar = st.progress(0)
+            failed_urls = []
+            
+            progress_text = "Processing URLs... This takes a few moments to avoid server blocks."
+            progress_bar = st.progress(0, text=progress_text)
             
             with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
                 for idx, url in enumerate(url_list):
                     title, data = extract_content(url)
+                    
                     if data and isinstance(data, list):
                         doc_io = create_word_doc(title, data)
+                        
+                        # Fix Filenames: Clean the title AND add a number so they never overwrite
                         clean_title = "".join([c for c in title if c.isalnum() or c==' ']).rstrip()
-                        zip_file.writestr(f"{clean_title}.docx", doc_io.getvalue())
+                        if not clean_title:
+                            clean_title = "Document"
+                            
+                        # Format: 01_Home.docx, 02_Clinic.docx
+                        safe_filename = f"{idx + 1:02d}_{clean_title}.docx"
+                        
+                        zip_file.writestr(safe_filename, doc_io.getvalue())
                         st.session_state.total_converted += 1
                         if title not in st.session_state.history:
                             st.session_state.history.append(title)
                         success_count += 1
-                    progress_bar.progress((idx + 1) / len(url_list))
+                    else:
+                        # Record why it failed
+                        failed_urls.append({'url': url, 'error': data})
+                        
+                    progress_bar.progress((idx + 1) / len(url_list), text=f"Processed {idx + 1} of {len(url_list)}")
             
+            # End of processing reporting
             if success_count > 0:
                 st.session_state.bulk_zip = zip_buffer.getvalue()
-                st.success(f"Processed {success_count} files!")
+                st.success(f"✅ Successfully processed {success_count} files!")
             else:
-                st.error("Bulk processing failed.")
+                st.error("Bulk processing failed entirely. Columbia's server may be temporarily blocking access.")
+                
+            if failed_urls:
+                st.warning(f"⚠️ {len(failed_urls)} URLs could not be processed:")
+                for fail in failed_urls:
+                    st.write(f"- {fail['url']} ({fail['error']})")
             
     if st.session_state.bulk_zip:
         st.download_button(
