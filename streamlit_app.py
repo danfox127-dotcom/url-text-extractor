@@ -6,9 +6,12 @@ from io import BytesIO
 import zipfile
 import time
 import random
+from PIL import Image
+from urllib.parse import urljoin
+import io
 
 # --- 1. SET PAGE CONFIG (Must be first) ---
-st.set_page_config(page_title="CUIMC Web-to-Word", page_icon="🩺", layout="wide")
+st.set_page_config(page_title="CUIMC Web Extractor", page_icon="🩺", layout="wide")
 
 # --- 2. INITIALIZE SESSION STATE ---
 if 'history' not in st.session_state:
@@ -117,7 +120,7 @@ def create_word_doc(title, formatted_data):
 # --- 5. APP LAYOUT ---
 apply_custom_style()
 
-st.title("🩺 CUIMC Web-to-Word Converter")
+st.title("🩺 CUIMC Web Extractor")
 
 with st.sidebar:
     st.header("📊 Dashboard")
@@ -133,7 +136,8 @@ with st.sidebar:
         st.session_state.bulk_zip = None
         st.rerun()
 
-tab1, tab2 = st.tabs(["📄 Single URL", "📦 Bulk ZIP Download"])
+# --- ADDED TAB 3 FOR IMAGES ---
+tab1, tab2, tab3 = st.tabs(["📄 Single URL (Word)", "📦 Bulk ZIP (Word)", "🖼️ Extract Images (ZIP)"])
 
 with tab1:
     url_input = st.text_input("Paste target URL:", key="single_input")
@@ -179,12 +183,8 @@ with tab2:
                     if data and isinstance(data, list):
                         doc_io = create_word_doc(title, data)
                         
-                        # Fix Filenames: Clean the title AND add a number so they never overwrite
                         clean_title = "".join([c for c in title if c.isalnum() or c==' ']).rstrip()
-                        if not clean_title:
-                            clean_title = "Document"
-                            
-                        # Format: 01_Home.docx, 02_Clinic.docx
+                        if not clean_title: clean_title = "Document"
                         safe_filename = f"{idx + 1:02d}_{clean_title}.docx"
                         
                         zip_file.writestr(safe_filename, doc_io.getvalue())
@@ -193,17 +193,15 @@ with tab2:
                             st.session_state.history.append(title)
                         success_count += 1
                     else:
-                        # Record why it failed
                         failed_urls.append({'url': url, 'error': data})
                         
                     progress_bar.progress((idx + 1) / len(url_list), text=f"Processed {idx + 1} of {len(url_list)}")
             
-            # End of processing reporting
             if success_count > 0:
                 st.session_state.bulk_zip = zip_buffer.getvalue()
                 st.success(f"✅ Successfully processed {success_count} files!")
             else:
-                st.error("Bulk processing failed entirely. Columbia's server may be temporarily blocking access.")
+                st.error("Bulk processing failed entirely.")
                 
             if failed_urls:
                 st.warning(f"⚠️ {len(failed_urls)} URLs could not be processed:")
@@ -217,3 +215,97 @@ with tab2:
             file_name="cuimc_batch_files.zip",
             mime="application/zip"
         )
+
+# ==========================================
+# TAB 3: INLINE IMAGE EXTRACTOR & ZIPPER
+# ==========================================
+with tab3:
+    st.header("🖼️ Extract & Convert Images")
+    st.markdown("Scrape all content images from a page, convert WebP/PNG to standard JPG, and download them as a ZIP.")
+
+    target_url_img = st.text_input("Enter Page URL to Scrape:", key="img_input")
+    
+    with st.expander("⚙️ Adjust Scraping Filters", expanded=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            min_width = st.number_input("Minimum Width (px)", value=200, step=50, help="Filters out small UI icons.")
+        with col2:
+            min_height = st.number_input("Minimum Height (px)", value=150, step=50, help="Filters out small UI buttons.")
+
+    if st.button("🔍 Extract Images", type="primary", key="btn_img"):
+        if target_url_img:
+            with st.spinner("Scraping page, filtering junk, and packing ZIP file..."):
+                try:
+                    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+                    response = requests.get(target_url_img, headers=headers, timeout=15)
+                    response.raise_for_status()
+                    soup = BeautifulSoup(response.content, 'html.parser')
+                    
+                    images = soup.find_all('img')
+                    extracted_images_data = [] 
+                    
+                    st.subheader("Extracted Content Images")
+                    
+                    for img in images:
+                        img_url = img.get('src')
+                        if not img_url: continue
+                            
+                        # Nomenclature Filter
+                        junk_keywords = ['logo', 'icon', 'social', 'facebook', 'twitter', 'instagram', 'svg', 'button', 'bg', 'footer']
+                        if any(junk in img_url.lower() for junk in junk_keywords): continue
+                            
+                        img_url = urljoin(target_url_img, img_url)
+                        
+                        try:
+                            img_response = requests.get(img_url, headers=headers, timeout=5)
+                            img_response.raise_for_status()
+                            image = Image.open(io.BytesIO(img_response.content))
+                            
+                            # Size Filter
+                            width, height = image.size
+                            if width >= min_width and height >= min_height:
+                                
+                                if image.mode in ("RGBA", "P"):
+                                    image = image.convert("RGB")
+                                
+                                img_byte_arr = io.BytesIO()
+                                image.save(img_byte_arr, format='JPEG', quality=90)
+                                img_bytes = img_byte_arr.getvalue()
+                                
+                                file_name = f"extracted_{width}x{height}_{len(extracted_images_data)}.jpg"
+                                extracted_images_data.append((file_name, img_bytes, image, img_url, width, height))
+                                
+                        except Exception:
+                            pass 
+                            
+                    if len(extracted_images_data) == 0:
+                        st.warning("No images found that match your minimum size criteria. Try lowering the px threshold.")
+                    else:
+                        st.success(f"✅ Successfully converted {len(extracted_images_data)} images.")
+                        
+                        zip_buffer = io.BytesIO()
+                        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                            for file_name, img_bytes, _, _, _, _ in extracted_images_data:
+                                zip_file.writestr(file_name, img_bytes)
+                        
+                        st.download_button(
+                            label="📦 Download All Images (ZIP)",
+                            data=zip_buffer.getvalue(),
+                            file_name="migrated_images.zip",
+                            mime="application/zip",
+                            type="primary",
+                            use_container_width=True
+                        )
+                        st.markdown("---")
+                        
+                        for file_name, img_bytes, img_obj, url, w, h in extracted_images_data:
+                            st_col1, st_col2 = st.columns([1, 3])
+                            with st_col1:
+                                st.image(img_obj, use_container_width=True)
+                            with st_col2:
+                                st.markdown(f"**Source:** `{url.split('/')[-1]}`")
+                                st.markdown(f"**Dimensions:** {w} x {h} px")
+                            st.markdown("---")
+                        
+                except Exception as e:
+                    st.error(f"Failed to scrape URL. Error: {e}")
