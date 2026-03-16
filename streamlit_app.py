@@ -76,43 +76,56 @@ def extract_content(url, retries=2):
                 url_parts = [p for p in url.split('/') if p]
                 title_text = url_parts[-1] if url_parts else "Columbia_Page"
             
-            # Clean title for filenames
-            clean_title = "".join([c for c in title_text if c.isalnum() or c in [' ', '-', '_']]).strip()
+            clean_title = "".join([c for c in title_text if c.isalnum() or c in [' ', '-', '_']]).strip()[:50]
             if not clean_title: clean_title = "Document"
-            # Truncate if too long (Windows hates super long folder names)
-            clean_title = clean_title[:50]
             
-            # --- CLEANUP NOISE ---
-            for element in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe"]):
+            # --- AGGRESSIVE CLEANUP FOR OLDER SITES ---
+            # 1. Standard HTML5 noise
+            for element in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "noscript"]):
                 element.decompose()
                 
-            content_area = soup.find('main') or soup.find('article') or soup.body
+            # 2. Hunt down older menu/sidebar divs and tables
+            junk_keywords = ['nav', 'menu', 'sidebar', 'foot', 'head', 'breadcrumb', 'search', 'widget']
+            for tag in soup.find_all(['div', 'ul', 'table', 'td']):
+                css_classes = " ".join(tag.get('class', [])).lower()
+                css_id = (tag.get('id') or "").lower()
+                attrs = css_classes + " " + css_id
+                
+                if any(word in attrs for word in junk_keywords):
+                    # Ensure we don't delete the main content box by accident
+                    if 'content' not in attrs and 'main' not in attrs and 'body' not in attrs:
+                        tag.decompose()
+                
+            # --- TARGET THE REAL CONTENT ---
+            # Look for explicit content containers before falling back to the body
+            content_area = (
+                soup.find('main') or 
+                soup.find('article') or 
+                soup.find(id=lambda x: x and 'content' in x.lower()) or 
+                soup.find(class_=lambda x: x and 'content' in str(x).lower()) or 
+                soup.body
+            )
             
             # --- IMAGE EXTRACTION ---
             images_data = []
             if content_area:
                 img_tags = content_area.find_all('img')
                 for idx, img in enumerate(img_tags):
-                    # Check standard src and lazy-loaded src attributes
                     src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
                     if not src or src.startswith('data:'): 
-                        continue # Skip empty or inline base64 images
+                        continue 
                     
-                    # Ensure URL is absolute (e.g., turns "/images/pic.jpg" into "https://site.com/images/pic.jpg")
                     abs_url = urljoin(url, src)
-                    
                     try:
-                        time.sleep(0.1) # Micro-pause so we don't trigger firewalls with rapid image requests
+                        time.sleep(0.1) 
                         img_res = requests.get(abs_url, headers=headers, timeout=10)
                         if img_res.status_code == 200:
-                            # Guess basic extension
                             ext = ".jpg"
                             if ".png" in abs_url.lower(): ext = ".png"
                             elif ".gif" in abs_url.lower(): ext = ".gif"
-                            
                             images_data.append((f"image_{idx + 1:02d}{ext}", img_res.content))
                     except Exception:
-                        pass # Silently skip broken images to prevent crashing the whole page extraction
+                        pass 
 
             # --- TEXT EXTRACTION ---
             formatted_data = []
@@ -120,15 +133,27 @@ def extract_content(url, retries=2):
             
             if content_area:
                 for element in content_area.find_all(tags_to_save):
+                    # Skip empty tags
+                    if not element.get_text(strip=True):
+                        continue
+                        
                     chunk = {'tag': element.name, 'content': []}
                     for child in element.children:
                         if isinstance(child, NavigableString):
-                            chunk['content'].append(('text', str(child)))
+                            text_content = str(child).strip()
+                            if text_content:
+                                chunk['content'].append(('text', text_content + ' '))
                         elif child.name in ['b', 'strong']:
-                            chunk['content'].append(('bold', child.get_text()))
+                            bold_text = child.get_text(strip=True)
+                            if bold_text:
+                                chunk['content'].append(('bold', bold_text + ' '))
                         else:
-                            chunk['content'].append(('text', child.get_text()))
-                    formatted_data.append(chunk)
+                            other_text = child.get_text(strip=True)
+                            if other_text:
+                                chunk['content'].append(('text', other_text + ' '))
+                    
+                    if chunk['content']:
+                        formatted_data.append(chunk)
                 
             return clean_title, formatted_data, images_data
             
@@ -188,7 +213,6 @@ st.divider()
 # --- SINGLE URL MODE ---
 if mode == "📄 Single URL Packager":
     st.subheader("📄 Single Page Extraction")
-    st.write("Generates a ZIP containing the Word Document and any extracted images.")
     url_input = st.text_input("Paste target URL:", key="single_input")
     
     if st.button("Package Document & Media", key="btn_single"):
@@ -198,27 +222,20 @@ if mode == "📄 Single URL Packager":
             if data == "RATE_LIMIT_ERROR":
                 st.error("⚠️ Server is rate-limiting us. Please wait 60 seconds.")
             elif data is not None and isinstance(data, list):
-                # 1. Create the Word Doc
                 doc_io = create_word_doc(clean_title, data)
-                
-                # 2. Package everything into a ZIP
                 zip_buffer = BytesIO()
                 with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
-                    # Write the Doc
                     zip_file.writestr(f"{clean_title}.docx", doc_io.getvalue())
-                    # Write the Images
                     for img_name, img_bytes in images:
                         zip_file.writestr(img_name, img_bytes)
                 
-                # 3. Save to Session State
                 st.session_state.active_file = zip_buffer.getvalue()
                 st.session_state.active_name = f"{clean_title}_Export.zip"
                 st.session_state.total_converted += 1
-                
                 if clean_title not in st.session_state.history:
                     st.session_state.history.append(clean_title)
             else:
-                st.error(f"Error: {images}") # images holds the error string here
+                st.error(f"Error: {images}")
 
     if st.session_state.active_file:
         st.success(f"✅ Ready: {st.session_state.active_name}")
@@ -232,8 +249,6 @@ if mode == "📄 Single URL Packager":
 # --- BULK URL MODE ---
 elif mode == "📦 Bulk List (Folders & Files)":
     st.subheader("📦 Bulk Batch Extraction")
-    st.write("Creates a Master ZIP. Each URL gets its own folder containing its Word Doc and images.")
-    
     bulk_input = st.text_area("Paste URLs here (one per line):", height=200)
     
     if st.button("Process Bulk List", key="btn_bulk"):
@@ -243,22 +258,17 @@ elif mode == "📦 Bulk List (Folders & Files)":
             success_count = 0
             failed_urls = []
             
-            progress_text = "Processing batch... Fetching images takes time to avoid firewalls."
-            progress_bar = st.progress(0, text=progress_text)
+            progress_bar = st.progress(0, text="Processing batch... Fetching images takes time to avoid firewalls.")
             
             with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
                 for idx, url in enumerate(url_list):
                     clean_title, data, images = extract_content(url)
                     
                     if data is not None and isinstance(data, list):
-                        # Create Folder Name
                         folder_name = f"{idx + 1:02d}_{clean_title}"
-                        
-                        # Write Word Doc INTO the folder
                         doc_io = create_word_doc(clean_title, data)
                         zip_file.writestr(f"{folder_name}/{clean_title}.docx", doc_io.getvalue())
                         
-                        # Write Images INTO the folder
                         for img_name, img_bytes in images:
                             zip_file.writestr(f"{folder_name}/{img_name}", img_bytes)
                             
@@ -267,7 +277,7 @@ elif mode == "📦 Bulk List (Folders & Files)":
                             st.session_state.history.append(clean_title)
                         success_count += 1
                     else:
-                        failed_urls.append({'url': url, 'error': images}) # error string is passed back here
+                        failed_urls.append({'url': url, 'error': images}) 
                         
                     progress_bar.progress((idx + 1) / len(url_list), text=f"Processed {idx + 1} of {len(url_list)}")
             
