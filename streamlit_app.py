@@ -6,6 +6,7 @@ from io import BytesIO
 import zipfile
 import time
 import random
+import re
 from urllib.parse import urljoin
 
 # --- 1. SET PAGE CONFIG ---
@@ -32,7 +33,7 @@ def apply_custom_style():
         </style>
     """, unsafe_allow_html=True)
 
-# --- 4. THE HYBRID EXTRACTION ENGINE ---
+# --- 4. THE UNIVERSAL EXTRACTION ENGINE ---
 def extract_content(url, retries=2):
     attempt = 0
     while attempt <= retries:
@@ -57,7 +58,7 @@ def extract_content(url, retries=2):
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             
-            # --- 4a. TITLE EXTRACTION ---
+            # --- TITLE EXTRACTION ---
             page_title = soup.find('title')
             h1_title = soup.find('h1')
             
@@ -70,13 +71,26 @@ def extract_content(url, retries=2):
             clean_title = "".join([c for c in title_text if c.isalnum() or c in [' ', '-', '_']]).strip()[:50]
             if not clean_title: clean_title = "Document"
             
-            # --- 4b. UNIVERSAL NOISE CLEANUP ---
-            for element in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "noscript"]):
-                element.decompose()
+            # --- STRICT JUNK CLEANUP ---
+            # 1. Standard structural junk
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe", "noscript", "button"]):
+                tag.decompose()
                 
-            content_area = soup.find('main') or soup.find('article') or soup.body
+            # 2. Hunt down menus and sidebars by their class/id names
+            junk_keywords = ['nav', 'menu', 'sidebar', 'foot', 'head', 'breadcrumb', 'search', 'widget', 'social', 'promo']
+            for tag in soup.find_all(['div', 'ul', 'section']):
+                if tag.attrs is None: continue
+                attrs_string = str(tag.get('id', '')).lower() + " " + " ".join(tag.get('class', [])).lower()
+                
+                if any(word in attrs_string for word in junk_keywords):
+                    # Don't accidentally delete the main body!
+                    if 'content' not in attrs_string and 'main' not in attrs_string and 'body' not in attrs_string:
+                        tag.decompose()
+
+            # Find the core container
+            content_area = soup.find('main') or soup.find(id=lambda x: x and 'content' in x.lower()) or soup.find('article') or soup.body
             
-            # --- 4c. IMAGE EXTRACTION (Universal) ---
+            # --- IMAGE EXTRACTION ---
             images_data = []
             if content_area:
                 img_tags = content_area.find_all('img')
@@ -97,68 +111,54 @@ def extract_content(url, retries=2):
                     except Exception:
                         pass 
 
-            # --- 4d. HYBRID TEXT EXTRACTION ---
+            # --- THE UNIVERSAL TEXT PARSER ---
             formatted_data = []
+            current_chunk = {'tag': 'p', 'content': []}
             
-            # STRATEGY 1: Modern Semantic Extraction
+            # Every time we hit one of these, it acts like pressing "Enter" on a keyboard
+            block_elements = {'p', 'div', 'br', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'tr', 'table', 'ul', 'ol', 'article', 'section', 'blockquote'}
+            
             if content_area:
-                for element in content_area.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'li']):
-                    if element.attrs is None: continue 
-                    if not element.get_text(strip=True): continue
-                        
-                    chunk = {'tag': element.name, 'content': []}
-                    for child in element.children:
-                        if isinstance(child, NavigableString):
-                            text_content = str(child).strip()
-                            if text_content: chunk['content'].append(('text', text_content + ' '))
-                        elif child.name in ['b', 'strong']:
-                            bold_text = child.get_text(strip=True)
-                            if bold_text: chunk['content'].append(('bold', bold_text + ' '))
-                        else:
-                            other_text = child.get_text(strip=True)
-                            if other_text: chunk['content'].append(('text', other_text + ' '))
-                    if chunk['content']: formatted_data.append(chunk)
-
-            # MEASURE: Did Strategy 1 fail? (e.g., found less than 3 paragraphs of text)
-            if len(formatted_data) < 3:
-                # STRATEGY 2: Legacy "DOM Flattener" (Triggered only if needed)
-                formatted_data = [] # Reset data
-                
-                # Aggressive Legacy Cleanup (Tables & Sidebars)
-                junk_keywords = ['nav', 'menu', 'sidebar', 'foot', 'head', 'breadcrumb', 'search', 'widget']
-                for tag in content_area.find_all(['div', 'ul', 'table', 'td', 'tr']):
-                    if tag.attrs is None: continue
-                    raw_class = tag.get('class', [])
-                    css_classes = " ".join(raw_class).lower() if isinstance(raw_class, list) else str(raw_class).lower()
-                    css_id = str(tag.get('id', '')).lower()
-                    attrs_string = css_classes + " " + css_id
-                    
-                    if any(word in attrs_string for word in junk_keywords):
-                        if 'content' not in attrs_string and 'main' not in attrs_string and 'body' not in attrs_string:
-                            tag.decompose()
-                            continue
-                    
-                    if tag.name == 'td' and tag.has_attr('width'):
-                        try:
-                            if int("".join(filter(str.isdigit, tag['width']))) < 300: tag.decompose()
-                        except: pass
-
-                # Flatten remaining legacy layout
-                current_chunk = {'tag': 'p', 'content': []}
-                block_elements = ['br', 'p', 'h1', 'h2', 'h3', 'h4', 'li', 'div', 'td', 'tr', 'table']
-
                 for element in content_area.descendants:
+                    # If it's pure text
                     if isinstance(element, NavigableString):
-                        text = str(element).strip()
-                        if text:
-                            if element.find_parent(['b', 'strong']): current_chunk['content'].append(('bold', text + ' '))
-                            else: current_chunk['content'].append(('text', text + ' '))
-                    elif element.name in block_elements:
-                        if current_chunk['content']: formatted_data.append(current_chunk)
-                        next_tag = element.name if element.name in ['h1', 'h2', 'h3', 'h4', 'li'] else 'p'
-                        current_chunk = {'tag': next_tag, 'content': []}
+                        text = str(element)
                         
-                if current_chunk['content']: formatted_data.append(current_chunk)
+                        # Skip massive blocks of empty code whitespace
+                        if not text.strip() and '\n' in text:
+                            continue
+                            
+                        # Normalize spaces so words don't mash together or spread too far apart
+                        text = re.sub(r'\s+', ' ', text)
+                        
+                        if text:
+                            is_bold = element.find_parent(['b', 'strong']) is not None
+                            
+                            # Inherit styles if inside a header or list
+                            parent_style = element.find_parent(['h1', 'h2', 'h3', 'h4', 'li'])
+                            if parent_style:
+                                current_chunk['tag'] = parent_style.name
+                                if parent_style.name.startswith('h'):
+                                    is_bold = True
+                                    
+                            current_chunk['content'].append(('bold' if is_bold else 'text', text))
+                            
+                    # If it's a structural block (like a paragraph, table row, or line break)
+                    elif element.name in block_elements:
+                        # Save the current sentence/paragraph if it has actual words in it
+                        if current_chunk['content']:
+                            combined_text = "".join(t[1] for t in current_chunk['content']).strip()
+                            if combined_text:
+                                formatted_data.append(current_chunk)
+                                
+                        # Start a fresh paragraph
+                        current_chunk = {'tag': 'p', 'content': []}
+                
+                # Catch the final paragraph at the end of the page
+                if current_chunk['content']:
+                    combined_text = "".join(t[1] for t in current_chunk['content']).strip()
+                    if combined_text:
+                        formatted_data.append(current_chunk)
 
             return clean_title, formatted_data, images_data
             
@@ -191,7 +191,7 @@ def create_word_doc(title, formatted_data):
 apply_custom_style()
 
 st.title("🩺 CUIMC Web-to-Word & Media Packager")
-st.write("Extract clean text and images from URLs. Adapts to both modern HTML5 and legacy websites.")
+st.write("Extract clean text and images from URLs. All outputs are packaged into standard ZIP archives.")
 
 with st.sidebar:
     st.header("📊 Dashboard")
