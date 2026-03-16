@@ -87,17 +87,23 @@ def extract_content(url, retries=2):
             # 2. Hunt down older menu/sidebar divs and tables
             junk_keywords = ['nav', 'menu', 'sidebar', 'foot', 'head', 'breadcrumb', 'search', 'widget']
             for tag in soup.find_all(['div', 'ul', 'table', 'td']):
-                css_classes = " ".join(tag.get('class', [])).lower()
-                css_id = (tag.get('id') or "").lower()
-                attrs = css_classes + " " + css_id
+                # SAFETY CHECK: If this tag was inside another tag that was already destroyed, skip it!
+                if tag.attrs is None:
+                    continue
                 
-                if any(word in attrs for word in junk_keywords):
+                # Safely parse classes whether it's a list or a string
+                raw_class = tag.get('class', [])
+                css_classes = " ".join(raw_class).lower() if isinstance(raw_class, list) else str(raw_class).lower()
+                css_id = str(tag.get('id') or "").lower()
+                
+                attrs_string = css_classes + " " + css_id
+                
+                if any(word in attrs_string for word in junk_keywords):
                     # Ensure we don't delete the main content box by accident
-                    if 'content' not in attrs and 'main' not in attrs and 'body' not in attrs:
+                    if 'content' not in attrs_string and 'main' not in attrs_string and 'body' not in attrs_string:
                         tag.decompose()
                 
             # --- TARGET THE REAL CONTENT ---
-            # Look for explicit content containers before falling back to the body
             content_area = (
                 soup.find('main') or 
                 soup.find('article') or 
@@ -111,6 +117,7 @@ def extract_content(url, retries=2):
             if content_area:
                 img_tags = content_area.find_all('img')
                 for idx, img in enumerate(img_tags):
+                    if img.attrs is None: continue # Safety check
                     src = img.get('src') or img.get('data-src') or img.get('data-lazy-src')
                     if not src or src.startswith('data:'): 
                         continue 
@@ -133,9 +140,8 @@ def extract_content(url, retries=2):
             
             if content_area:
                 for element in content_area.find_all(tags_to_save):
-                    # Skip empty tags
-                    if not element.get_text(strip=True):
-                        continue
+                    if element.attrs is None: continue # Safety check
+                    if not element.get_text(strip=True): continue
                         
                     chunk = {'tag': element.name, 'content': []}
                     for child in element.children:
