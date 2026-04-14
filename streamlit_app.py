@@ -12,6 +12,7 @@ from PIL import Image
 from urllib.parse import urljoin, urlparse, urlunparse
 import io
 import re
+import html
 import logging
 import tempfile
 import os
@@ -310,6 +311,73 @@ def create_word_doc(title, formatted_data):
     bio.seek(0)
     return bio
 
+def create_html(title, formatted_data):
+    """Return a BytesIO containing a simple HTML rendering of the extracted content."""
+    def _render(content):
+        out = []
+        for t, v in content:
+            if t == 'text':
+                out.append(html.escape(v))
+            elif t == 'bold':
+                out.append(f"<strong>{html.escape(v)}</strong>")
+            elif t == 'italic':
+                out.append(f"<em>{html.escape(v)}</em>")
+            elif t == 'link':
+                txt, href = v
+                if href:
+                    out.append(f"<a href=\"{html.escape(href)}\" target=\"_blank\" rel=\"noopener noreferrer\">{html.escape(txt)}</a>")
+                else:
+                    out.append(html.escape(txt))
+            else:
+                out.append(html.escape(str(v)))
+        return ''.join(out)
+
+    parts = []
+    parts.append('<!doctype html>')
+    parts.append('<html lang="en">')
+    parts.append('<head>')
+    parts.append('<meta charset="utf-8">')
+    parts.append(f'<title>{html.escape(title)}</title>')
+    parts.append('</head>')
+    parts.append('<body>')
+    parts.append(f'<h1>{html.escape(title)}</h1>')
+
+    in_list = False
+    for chunk in formatted_data:
+        tag = chunk.get('tag', '')
+        if tag == 'li':
+            if not in_list:
+                parts.append('<ul>')
+                in_list = True
+            parts.append(f"<li>{_render(chunk['content'])}</li>")
+            continue
+        else:
+            if in_list:
+                parts.append('</ul>')
+                in_list = False
+
+        if tag and tag.startswith('h') and len(tag) == 2 and tag[1].isdigit():
+            level = min(4, int(tag[1]))
+            parts.append(f"<h{level}>{_render(chunk['content'])}</h{level}>")
+            continue
+
+        if tag == 'blockquote':
+            parts.append(f"<blockquote>{_render(chunk['content'])}</blockquote>")
+            continue
+
+        parts.append(f"<p>{_render(chunk['content'])}</p>")
+
+    if in_list:
+        parts.append('</ul>')
+
+    parts.append('</body></html>')
+
+    html_str = '\n'.join(parts)
+    bio = BytesIO()
+    bio.write(html_str.encode('utf-8'))
+    bio.seek(0)
+    return bio
+
 def clean_filename(title):
     clean = "".join([c for c in title if c.isalnum() or c==' ']).strip().replace(' ', '_')
     return clean if clean else "extracted_content"
@@ -346,6 +414,9 @@ with tab1:
             elif data and isinstance(data, list):
                 st.session_state.active_file = create_word_doc(title, data)
                 st.session_state.active_name = f"{clean_filename(title)}.docx"
+                # also prepare an HTML export
+                st.session_state.active_html = create_html(title, data)
+                st.session_state.active_html_name = f"{clean_filename(title)}.html"
                 st.session_state.total_converted += 1
                 if title not in st.session_state.history:
                     st.session_state.history.append(title)
@@ -360,6 +431,13 @@ with tab1:
             file_name=st.session_state.active_name,
             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         )
+        if 'active_html' in st.session_state and st.session_state.active_html:
+            st.download_button(
+                label="🌐 Download HTML File",
+                data=st.session_state.active_html,
+                file_name=st.session_state.active_html_name,
+                mime="text/html"
+            )
 
 with tab2:
     bulk_input = st.text_area("Paste URLs (one per line):", height=200)
@@ -389,8 +467,10 @@ with tab2:
 
                     if data and isinstance(data, list):
                         doc_io = create_word_doc(title, data)
-                        safe_filename = f"{idx + 1:02d}_{clean_filename(title)}.docx"
-                        zipf.writestr(safe_filename, doc_io.getvalue())
+                        html_io = create_html(title, data)
+                        safe_base = f"{idx + 1:02d}_{clean_filename(title)}"
+                        zipf.writestr(f"{safe_base}.docx", doc_io.getvalue())
+                        zipf.writestr(f"{safe_base}.html", html_io.getvalue())
                         st.session_state.total_converted += 1
                         if title not in st.session_state.history:
                             st.session_state.history.append(title)
@@ -527,6 +607,13 @@ with tab4:
                     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
                         # Write the Word Doc
                         zip_file.writestr(f"{safe_title}.docx", doc_io.getvalue())
+                        # include an HTML export as well
+                        try:
+                            html_io = create_html(title, data)
+                            zip_file.writestr(f"{safe_title}.html", html_io.getvalue())
+                        except Exception:
+                            # non-fatal: continue packaging
+                            pass
 
                         # Write the Images into an 'images' folder
                         for file_name, img_bytes, src in extracted_images:
