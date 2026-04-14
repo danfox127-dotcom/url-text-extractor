@@ -71,23 +71,31 @@ def extract_content(url, retries=2):
                 url_parts = [p for p in url.split('/') if p]
                 title_text = url_parts[-1] if url_parts else "Columbia_Page"
             
-            for element in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe"]):
+            for element in soup(["script", "style", "nav", "footer", "header", "form", "iframe"]):
                 element.decompose()
                 
             content_area = soup.find('main') or soup.find('article') or soup.body
             formatted_data = []
-            tags_to_save = ['p', 'h2', 'h3', 'h4', 'li']
+            tags_to_save = ['p', 'h2', 'h3', 'h4', 'li', 'blockquote']
             
             for element in content_area.find_all(tags_to_save):
+                # Prevent duplicate lines (e.g. a <p> inside an <li> creates a duplicate paragraph)
+                if element.find_parent(tags_to_save):
+                    continue
+                    
                 chunk = {'tag': element.name, 'content': []}
                 for child in element.children:
                     if isinstance(child, NavigableString):
-                        chunk['content'].append(('text', str(child)))
+                        text_content = re.sub(r'\s+', ' ', str(child))
+                        chunk['content'].append(('text', text_content))
                     elif child.name in ['b', 'strong']:
-                        chunk['content'].append(('bold', child.get_text()))
+                        chunk['content'].append(('bold', child.get_text(separator=' ') + " "))
                     else:
-                        chunk['content'].append(('text', child.get_text()))
-                formatted_data.append(chunk)
+                        chunk['content'].append(('text', child.get_text(separator=' ') + " "))
+                
+                # Only add if there is actual text (prevents empty lines)
+                if any(text.strip() for _, text in chunk['content']):
+                    formatted_data.append(chunk)
                 
             return title_text, formatted_data
             
@@ -102,7 +110,12 @@ def create_word_doc(title, formatted_data):
     doc = Document()
     doc.add_heading(title, 0)
     for chunk in formatted_data:
-        p_style = 'List Bullet' if chunk['tag'] == 'li' else None
+        p_style = None
+        if chunk['tag'] == 'li':
+            p_style = 'List Bullet'
+        elif chunk['tag'] == 'blockquote':
+            p_style = 'Intense Quote'
+            
         p = doc.add_paragraph(style=p_style) if p_style else doc.add_paragraph()
         for style_type, text in chunk['content']:
             run = p.add_run(text)

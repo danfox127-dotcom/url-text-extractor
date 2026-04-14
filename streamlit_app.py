@@ -9,8 +9,6 @@ import random
 from PIL import Image
 from urllib.parse import urljoin
 import io
-import csv
-import re
 
 # --- 1. SET PAGE CONFIG (Must be first) ---
 st.set_page_config(page_title="CUIMC Web Extractor", page_icon="🩺", layout="wide")
@@ -41,59 +39,6 @@ def apply_custom_style():
     """, unsafe_allow_html=True)
 
 # --- 4. SCRAPING & FORMATTING LOGIC ---
-def extract_images(url, min_width=200, min_height=150, retries=2):
-    attempt = 0
-    while attempt <= retries:
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            time.sleep(random.uniform(1.0, 2.0))
-            response = requests.get(url, headers=headers, timeout=15)
-            if response.status_code == 429:
-                if attempt < retries:
-                    time.sleep(3)
-                    attempt += 1
-                    continue
-                return []
-            response.raise_for_status()
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            extracted_images = []
-            
-            for img in soup.find_all('img'):
-                # Try multiple attributes for lazy loading
-                img_url = img.get('data-src') or img.get('data-lazy-src') or img.get('src')
-                
-                # Check srcset if needed
-                if not img_url and img.get('srcset'):
-                    img_url = img.get('srcset').split(',')[0].split(' ')[0]
-                    
-                if not img_url: continue
-                    
-                junk_keywords = ['logo', 'icon', 'social', 'facebook', 'twitter', 'instagram', 'svg', 'button', 'bg', 'footer', 'avatar']
-                if any(junk in img_url.lower() for junk in junk_keywords): continue
-                    
-                img_url = urljoin(url, img_url)
-                try:
-                    img_resp = requests.get(img_url, headers=headers, timeout=5)
-                    image = Image.open(io.BytesIO(img_resp.content))
-                    w, h = image.size
-                    if w >= min_width and h >= min_height:
-                        if image.mode in ("RGBA", "P", "LA"): image = image.convert("RGB")
-                        img_bytes = io.BytesIO()
-                        image.save(img_bytes, format='JPEG', quality=90)
-                        file_name = f"extracted_{w}x{h}_{len(extracted_images)}.jpg"
-                        extracted_images.append((file_name, img_bytes.getvalue()))
-                except:
-                    passtext_content = str(child).replace('\n', ' ')
-                        chunk['content'].append(('text', text_content))
-                    elif child.name in ['b', 'strong']:
-                        chunk['content'].append(('bold', child.get_text(separator=' ') + " "))
-                    else:
-                        chunk['content'].append(('text', child.get_text(separator=' ') + " "
-                attempt += 1
-            else:
-                return []
-
 def extract_content(url, retries=2):
     attempt = 0
     while attempt <= retries:
@@ -126,23 +71,31 @@ def extract_content(url, retries=2):
                 url_parts = [p for p in url.split('/') if p]
                 title_text = url_parts[-1] if url_parts else "Columbia_Page"
             
-            for element in soup(["script", "style", "nav", "footer", "header", "aside", "form", "iframe"]):
+            for element in soup(["script", "style", "nav", "footer", "header", "form", "iframe"]):
                 element.decompose()
                 
             content_area = soup.find('main') or soup.find('article') or soup.body
             formatted_data = []
-            tags_to_save = ['p', 'h2', 'h3', 'h4', 'li']
+            tags_to_save = ['p', 'h2', 'h3', 'h4', 'li', 'blockquote']
             
             for element in content_area.find_all(tags_to_save):
+                # Prevent duplicate lines (e.g. a <p> inside an <li> creates a duplicate paragraph)
+                if element.find_parent(tags_to_save):
+                    continue
+                    
                 chunk = {'tag': element.name, 'content': []}
                 for child in element.children:
                     if isinstance(child, NavigableString):
-                        chunk['content'].append(('text', str(child)))
+                        text_content = re.sub(r'\s+', ' ', str(child))
+                        chunk['content'].append(('text', text_content))
                     elif child.name in ['b', 'strong']:
-                        chunk['content'].append(('bold', child.get_text()))
+                        chunk['content'].append(('bold', child.get_text(separator=' ') + " "))
                     else:
-                        chunk['content'].append(('text', child.get_text()))
-                formatted_data.append(chunk)
+                        chunk['content'].append(('text', child.get_text(separator=' ') + " "))
+                
+                # Only add if there is actual text (prevents empty lines)
+                if any(text.strip() for _, text in chunk['content']):
+                    formatted_data.append(chunk)
                 
             return title_text, formatted_data
             
@@ -157,7 +110,12 @@ def create_word_doc(title, formatted_data):
     doc = Document()
     doc.add_heading(title, 0)
     for chunk in formatted_data:
-        p_style = 'List Bullet' if chunk['tag'] == 'li' else None
+        p_style = None
+        if chunk['tag'] == 'li':
+            p_style = 'List Bullet'
+        elif chunk['tag'] == 'blockquote':
+            p_style = 'Intense Quote'
+            
         p = doc.add_paragraph(style=p_style) if p_style else doc.add_paragraph()
         for style_type, text in chunk['content']:
             run = p.add_run(text)
@@ -221,64 +179,37 @@ with tab1:
         )
 
 with tab2:
-    st.header("📦 Bulk Process (CSV or List)")
-    st.markdown("Upload a CSV or paste URLs. Organizes into folders. Select 'Include Images' for God Mode Bulk.")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        bulk_csv = st.file_uploader("Upload CSV (Finds URLs automatically)", type=['csv'])
-    with col2:
-        bulk_input = st.text_area("Or paste URLs (one per line):", height=100)
-        
-    extract_images_also = st.checkbox("🖼️ Include Images (God Mode Bulk)", value=False)
-    
+    bulk_input = st.text_area("Paste URLs (one per line):", height=200)
     if st.button("Process Bulk List", key="btn_bulk"):
-        url_list = []
-        if bulk_csv:
-            csv_text = bulk_csv.getvalue().decode('utf-8').splitlines()
-            reader = csv.reader(csv_text)
-            for row in reader:
-                for cell in row:
-                    if cell.strip().startswith('http://') or cell.strip().startswith('https://'):
-                        url_list.append(cell.strip())
-        
-        url_list += [u.strip() for u in bulk_input.split('\n') if u.strip() and u.strip().startswith('http')]
-        url_list = list(dict.fromkeys(url_list)) # Remove duplicates
-
+        url_list = [u.strip() for u in bulk_input.split('\n') if u.strip()]
         if url_list:
             zip_buffer = BytesIO()
             success_count = 0
+            failed_urls = []
             
             progress_bar = st.progress(0, text="Processing URLs...")
             
             with zipfile.ZipFile(zip_buffer, "a", zipfile.ZIP_DEFLATED, False) as zip_file:
                 for idx, url in enumerate(url_list):
-                    progress_bar.progress(idx / len(url_list), text=f"Processing {idx + 1} of {len(url_list)}: {url[:30]}...")
-                    
                     title, data = extract_content(url)
                     
                     if data and isinstance(data, list):
-                        safe_title = clean_filename(title)
-                        folder_name = f"{idx + 1:03d}_{safe_title}"
-                        
                         doc_io = create_word_doc(title, data)
-                        zip_file.writestr(f"{folder_name}/{safe_title}.docx", doc_io.getvalue())
+                        safe_filename = f"{idx + 1:02d}_{clean_filename(title)}.docx"
                         
-                        if extract_images_also:
-                            images_data = extract_images(url)
-                            for file_name, img_bytes in images_data:
-                                zip_file.writestr(f"{folder_name}/images/{file_name}", img_bytes)
-                                
+                        zip_file.writestr(safe_filename, doc_io.getvalue())
                         st.session_state.total_converted += 1
                         if title not in st.session_state.history:
                             st.session_state.history.append(title)
                         success_count += 1
-            
-            progress_bar.progress(1.0, text="Done!")
+                    else:
+                        failed_urls.append({'url': url, 'error': data})
+                        
+                    progress_bar.progress((idx + 1) / len(url_list), text=f"Processed {idx + 1} of {len(url_list)}")
             
             if success_count > 0:
                 st.session_state.bulk_zip = zip_buffer.getvalue()
-                st.success(f"✅ Successfully processed {success_count} URLs!")
+                st.success(f"✅ Successfully processed {success_count} files!")
             else:
                 st.error("Bulk processing failed entirely.")
             
@@ -307,14 +238,51 @@ with tab3:
         if target_url_img:
             with st.spinner("Scraping page, filtering junk, and packing ZIP file..."):
                 try:
-                    # Get page title for ZIP
-                    title, _ = extract_content(target_url_img)
-                    page_name = title if title else "Images"
+                    headers = {'User-Agent': 'Mozilla/5.0'}
+                    response = requests.get(target_url_img, headers=headers, timeout=15)
+                    response.raise_for_status()
+                    soup = BeautifulSoup(response.content, 'html.parser')
+                    
+                    # Try to get the page title for the ZIP name
+                    h1_tag = soup.find('h1')
+                    if h1_tag:
+                        page_name = h1_tag.get_text()
+                    else:
+                        url_parts = [p for p in target_url_img.split('/') if p]
+                        page_name = url_parts[-1] if url_parts else "Images"
+                    
                     zip_filename = f"{clean_filename(page_name)}.zip"
                     
-                    extracted_images_data = extract_images(target_url_img, min_width, min_height)
+                    images = soup.find_all('img')
+                    extracted_images_data = [] 
+                    
+                    for img in images:
+                        img_url = img.get('src')
+                        if not img_url: continue
                             
-                    if not extracted_images_data:
+                        junk_keywords = ['logo', 'icon', 'social', 'facebook', 'twitter', 'instagram', 'svg', 'button', 'bg', 'footer']
+                        if any(junk in img_url.lower() for junk in junk_keywords): continue
+                            
+                        img_url = urljoin(target_url_img, img_url)
+                        
+                        try:
+                            img_response = requests.get(img_url, headers=headers, timeout=5)
+                            img_response.raise_for_status()
+                            image = Image.open(io.BytesIO(img_response.content))
+                            
+                            width, height = image.size
+                            if width >= min_width and height >= min_height:
+                                if image.mode in ("RGBA", "P"):
+                                    image = image.convert("RGB")
+                                
+                                img_byte_arr = io.BytesIO()
+                                image.save(img_byte_arr, format='JPEG', quality=90)
+                                file_name = f"extracted_{width}x{height}_{len(extracted_images_data)}.jpg"
+                                extracted_images_data.append((file_name, img_byte_arr.getvalue()))
+                        except Exception:
+                            pass 
+                            
+                    if len(extracted_images_data) == 0:
                         st.warning("No images found matching criteria.")
                     else:
                         st.success(f"✅ Extracted {len(extracted_images_data)} images.")
@@ -403,13 +371,15 @@ with tab4:
                             
                     st.success(f"✅ Extracted '{title}' and {len(extracted_images)} images.")
                     st.session_state.total_converted += 1
-                    extracted_images = extract_images(target_url_all, min_w, min_h)
-                            
-                    # 3. Build the Master ZIP
-                    zip_buffer = io.BytesIO()
-                    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                        # Write the Word Doc
-                        zip_file.writestr(f"{safe_title}.docx", doc_io.getvalue())
-                        # Write the Images into an 'images' folder
-                        for file_name, img_bytes in extracted_images:
-                            zip_file.writestr(f"images/{file_name}"
+                    
+                    st.download_button(
+                        label=f"📦 Download Master ZIP ({safe_title})",
+                        data=zip_buffer.getvalue(),
+                        file_name=master_zip_name,
+                        mime="application/zip",
+                        type="primary",
+                        use_container_width=True
+                    )
+                    
+                except Exception as e:
+                    st.error(f"Full extraction failed. Error: {e}")
