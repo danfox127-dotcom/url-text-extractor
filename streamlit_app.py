@@ -195,7 +195,7 @@ def extract_content(url, retries=2):
     while attempt <= retries:
         try:
             time.sleep(random.uniform(0.2, 0.5))
-            response = session.get(url, timeout=15)
+            response = session.get(url, timeout=(5, 12))
 
             if response.status_code == 429:
                 if attempt < retries:
@@ -440,55 +440,104 @@ with tab1:
                 mime="text/html"
             )
 
+_NON_HTML_EXTS = {
+    '.pdf', '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp', '.avif',
+    '.zip', '.gz', '.tar', '.docx', '.xlsx', '.pptx', '.csv',
+    '.mp4', '.mp3', '.avi', '.mov', '.wav', '.ogg',
+    '.ico', '.json', '.xml', '.js', '.css',
+}
+
+def is_likely_html(url):
+    """Return True if the URL extension suggests an HTML page (or no extension)."""
+    try:
+        path = urlparse(url).path.lower().rstrip('/')
+        _, ext = os.path.splitext(path)
+        return ext not in _NON_HTML_EXTS
+    except Exception:
+        return True
+
 with tab2:
     bulk_input = st.text_area("Paste URLs (one per line):", height=200)
-    concurrency = st.slider("Concurrent requests", min_value=1, max_value=10, value=5,
-                            help="Higher = faster, but more likely to trigger rate limits on some sites")
+    col_conc, col_html = st.columns([2, 1])
+    with col_conc:
+        concurrency = st.slider("Concurrent requests", min_value=1, max_value=10, value=5,
+                                help="Higher = faster, but more likely to trigger rate limits on some sites")
+    with col_html:
+        html_only = st.checkbox("HTML pages only", value=True,
+                                help="Skip PDFs, images, and other non-HTML URLs")
+
     if st.button("Process Bulk List", key="btn_bulk"):
-        url_list = [u.strip() for u in bulk_input.split('\n') if u.strip()]
+        raw_list = [u.strip() for u in bulk_input.split('\n') if u.strip()]
+
+        # Partition into HTML and skipped
+        if html_only:
+            url_list = [u for u in raw_list if is_likely_html(u)]
+            skipped = [u for u in raw_list if not is_likely_html(u)]
+        else:
+            url_list = raw_list
+            skipped = []
+
+        if skipped:
+            st.info(f"Skipping {len(skipped)} non-HTML URL(s): " + ", ".join(s[:60] for s in skipped[:5]) + ("…" if len(skipped) > 5 else ""))
+
         if url_list:
-            success_count = 0
-            failed_urls = []
-            completed = 0
+            # ── per-URL status tracking ──────────────────────────────────
+            # States: 0=pending, 1=fetching, 2=done, 3=failed
+            import threading
+            statuses = [0] * len(url_list)   # 0=pending 1=fetching 2=done 3=failed
+            lock = threading.Lock()
 
-            progress_bar = st.progress(0, text="Processing URLs...")
-            status_text = st.empty()
+            ICONS = {0: '⬜', 1: '🔄', 2: '✅', 3: '❌'}
 
-            # results dict keyed by original index to preserve order
-            results_map = {}
+            progress_bar = st.progress(0)
+            summary_text = st.empty()
+            grid_placeholder = st.empty()
 
-            def fetch_url(idx_url):
+            def render_grid():
+                with lock:
+                    snap = list(statuses)
+                done   = snap.count(2)
+                failed = snap.count(3)
+                fetch  = snap.count(1)
+                total  = len(snap)
+                progress_bar.progress((done + failed) / total,
+                                      text=f"{done + failed}/{total} done  •  {fetch} in-flight  •  {failed} failed")
+                # show a compact icon grid (up to 60 icons before truncating)
+                icons = ''.join(ICONS[s] for s in snap[:60])
+                if total > 60:
+                    icons += f'  +{total - 60} more'
+                grid_placeholder.markdown(icons)
+
+            def fetch_url_tracked(idx_url):
                 idx, url = idx_url
+                with lock:
+                    statuses[idx] = 1        # fetching
+                render_grid()
                 title, data = extract_content(url)
+                with lock:
+                    statuses[idx] = 2 if (data and isinstance(data, list)) else 3
+                render_grid()
                 return idx, url, title, data
 
-            use_temp = len(url_list) > 30
-            tmp_path = None
+            render_grid()
+            results_map = {}
+            failed_urls = []
 
-            if use_temp:
-                tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
-                tmp_path = tmp_file.name
-                tmp_file.close()
-                zipf = zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED)
-            else:
-                zip_buffer = BytesIO()
-                zipf = zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED)
-
+            zip_buffer = BytesIO()
+            zipf = zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED)
             try:
                 with ThreadPoolExecutor(max_workers=concurrency) as executor:
-                    futures = {executor.submit(fetch_url, (i, u)): i for i, u in enumerate(url_list)}
+                    futures = [executor.submit(fetch_url_tracked, (i, u))
+                               for i, u in enumerate(url_list)]
                     for future in as_completed(futures):
                         idx, url, title, data = future.result()
-                        completed += 1
-                        progress_bar.progress(completed / len(url_list), text=f"Processed {completed} of {len(url_list)}")
-                        status_text.text(f"↳ {url[:80]}...")
-
                         if data and isinstance(data, list):
                             results_map[idx] = (url, title, data)
                         else:
                             failed_urls.append({'url': url, 'error': data})
 
-                # write to zip in original URL order
+                # pack ZIP in original URL order
+                success_count = 0
                 for idx in sorted(results_map.keys()):
                     url, title, data = results_map[idx]
                     doc_io = create_word_doc(title, data)
@@ -503,27 +552,20 @@ with tab2:
             finally:
                 zipf.close()
 
-            status_text.empty()
+            grid_placeholder.empty()
 
             if success_count > 0:
-                if use_temp and tmp_path:
-                    with open(tmp_path, 'rb') as f:
-                        st.session_state.bulk_zip = f.read()
-                    try:
-                        os.remove(tmp_path)
-                    except Exception:
-                        pass
-                else:
-                    st.session_state.bulk_zip = zip_buffer.getvalue()
-
-                st.success(f"✅ Successfully processed {success_count} files!")
+                st.session_state.bulk_zip = zip_buffer.getvalue()
+                st.success(f"✅ Successfully processed {success_count} of {len(url_list)} URLs")
                 if failed_urls:
-                    with st.expander("Failed URLs"):
+                    with st.expander(f"❌ {len(failed_urls)} failed URL(s)"):
                         for item in failed_urls:
                             st.write(f"- {item['url']}: {item['error']}")
             else:
-                st.error("Bulk processing failed entirely.")
-            
+                st.error("All URLs failed — check that they are reachable HTML pages.")
+        elif not skipped:
+            st.warning("No URLs to process.")
+
     if st.session_state.bulk_zip:
         st.download_button(
             label="📥 Download ZIP Archive",
