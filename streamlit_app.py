@@ -509,14 +509,13 @@ with tab2:
                 grid_placeholder.markdown(icons)
 
             def fetch_url_tracked(idx_url):
+                # Runs in a thread — only mutates statuses, never touches Streamlit UI
                 idx, url = idx_url
                 with lock:
                     statuses[idx] = 1        # fetching
-                render_grid()
                 title, data = extract_content(url)
                 with lock:
                     statuses[idx] = 2 if (data and isinstance(data, list)) else 3
-                render_grid()
                 return idx, url, title, data
 
             render_grid()
@@ -531,6 +530,7 @@ with tab2:
                                for i, u in enumerate(url_list)]
                     for future in as_completed(futures):
                         idx, url, title, data = future.result()
+                        render_grid()   # update UI on the main thread after each completion
                         if data and isinstance(data, list):
                             results_map[idx] = (url, title, data)
                         else:
