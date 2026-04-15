@@ -16,6 +16,7 @@ import html
 import logging
 import tempfile
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- 1. SET PAGE CONFIG (Must be first) ---
 st.set_page_config(page_title="CUIMC Web Extractor", page_icon="🩺", layout="wide")
@@ -193,7 +194,7 @@ def extract_content(url, retries=2):
     attempt = 0
     while attempt <= retries:
         try:
-            time.sleep(random.uniform(1.5, 3.0))
+            time.sleep(random.uniform(0.2, 0.5))
             response = session.get(url, timeout=15)
 
             if response.status_code == 429:
@@ -441,13 +442,25 @@ with tab1:
 
 with tab2:
     bulk_input = st.text_area("Paste URLs (one per line):", height=200)
+    concurrency = st.slider("Concurrent requests", min_value=1, max_value=10, value=5,
+                            help="Higher = faster, but more likely to trigger rate limits on some sites")
     if st.button("Process Bulk List", key="btn_bulk"):
         url_list = [u.strip() for u in bulk_input.split('\n') if u.strip()]
         if url_list:
             success_count = 0
             failed_urls = []
+            completed = 0
 
             progress_bar = st.progress(0, text="Processing URLs...")
+            status_text = st.empty()
+
+            # results dict keyed by original index to preserve order
+            results_map = {}
+
+            def fetch_url(idx_url):
+                idx, url = idx_url
+                title, data = extract_content(url)
+                return idx, url, title, data
 
             use_temp = len(url_list) > 30
             tmp_path = None
@@ -462,25 +475,35 @@ with tab2:
                 zipf = zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED)
 
             try:
-                for idx, url in enumerate(url_list):
-                    title, data = extract_content(url)
+                with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                    futures = {executor.submit(fetch_url, (i, u)): i for i, u in enumerate(url_list)}
+                    for future in as_completed(futures):
+                        idx, url, title, data = future.result()
+                        completed += 1
+                        progress_bar.progress(completed / len(url_list), text=f"Processed {completed} of {len(url_list)}")
+                        status_text.text(f"↳ {url[:80]}...")
 
-                    if data and isinstance(data, list):
-                        doc_io = create_word_doc(title, data)
-                        html_io = create_html(title, data)
-                        safe_base = f"{idx + 1:02d}_{clean_filename(title)}"
-                        zipf.writestr(f"{safe_base}.docx", doc_io.getvalue())
-                        zipf.writestr(f"{safe_base}.html", html_io.getvalue())
-                        st.session_state.total_converted += 1
-                        if title not in st.session_state.history:
-                            st.session_state.history.append(title)
-                        success_count += 1
-                    else:
-                        failed_urls.append({'url': url, 'error': data})
+                        if data and isinstance(data, list):
+                            results_map[idx] = (url, title, data)
+                        else:
+                            failed_urls.append({'url': url, 'error': data})
 
-                    progress_bar.progress((idx + 1) / len(url_list), text=f"Processed {idx + 1} of {len(url_list)}")
+                # write to zip in original URL order
+                for idx in sorted(results_map.keys()):
+                    url, title, data = results_map[idx]
+                    doc_io = create_word_doc(title, data)
+                    html_io = create_html(title, data)
+                    safe_base = f"{idx + 1:02d}_{clean_filename(title)}"
+                    zipf.writestr(f"{safe_base}.docx", doc_io.getvalue())
+                    zipf.writestr(f"{safe_base}.html", html_io.getvalue())
+                    st.session_state.total_converted += 1
+                    if title not in st.session_state.history:
+                        st.session_state.history.append(title)
+                    success_count += 1
             finally:
                 zipf.close()
+
+            status_text.empty()
 
             if success_count > 0:
                 if use_temp and tmp_path:
