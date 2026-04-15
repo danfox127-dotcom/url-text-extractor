@@ -484,8 +484,11 @@ with tab2:
             # ── per-URL status tracking ──────────────────────────────────
             # States: 0=pending, 1=fetching, 2=done, 3=failed
             import threading
+            from collections import defaultdict
             statuses = [0] * len(url_list)   # 0=pending 1=fetching 2=done 3=failed
             lock = threading.Lock()
+            # One semaphore per domain — prevents hammering a single server
+            domain_sems = defaultdict(lambda: threading.Semaphore(1))
 
             ICONS = {0: '⬜', 1: '🔄', 2: '✅', 3: '❌'}
 
@@ -513,7 +516,9 @@ with tab2:
                 idx, url = idx_url
                 with lock:
                     statuses[idx] = 1        # fetching
-                title, data = extract_content(url)
+                domain = urlparse(url).netloc
+                with domain_sems[domain]:    # max 1 concurrent request per domain
+                    title, data = extract_content(url)
                 with lock:
                     statuses[idx] = 2 if (data and isinstance(data, list)) else 3
                 return idx, url, title, data
