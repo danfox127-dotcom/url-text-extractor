@@ -466,8 +466,15 @@ with tab2:
         html_only = st.checkbox("HTML pages only", value=True,
                                 help="Skip PDFs, images, and other non-HTML URLs")
 
+    path_filter_input = st.text_input("Only include URLs containing paths (comma-separated, e.g., /blog/, /news/):", help="Leave blank to include all URLs.")
+
     if st.button("Process Bulk List", key="btn_bulk"):
         raw_list = [u.strip() for u in bulk_input.split('\n') if u.strip()]
+
+        if path_filter_input.strip():
+            allowed_paths = [p.strip() for p in path_filter_input.split(',') if p.strip()]
+            if allowed_paths:
+                raw_list = [u for u in raw_list if any(p in u for p in allowed_paths)]
 
         # Partition into HTML and skipped
         if html_only:
